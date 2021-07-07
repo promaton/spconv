@@ -1,0 +1,277 @@
+# SPConv build in docker
+#
+# We build the binary package (wheel) targetting the versions below.
+#
+# Build number of this package
+ARG BUILD_NUMBER=1
+# Cuda version depends on the target hardware we want to use the package and the
+# supported version by the other libraries (i.e.: torch).
+ARG CUDA_MAJOR_VERSION=11
+ARG CUDA_MINOR_VERSION=1
+ARG CUDA_VERSION=11.1
+# CuDNN depends on the Cuda major. For 10.x this could be 7.
+ARG CUDNN_MAJOR_VERSION=8
+# Target python version.
+ARG PYTHON_VERSION=3.7.9
+# Specific version and commit to build
+ARG SPCONV_BRANCH=build-fixes
+ARG SPCONV_COMMIT=5961c22b14505cb616d74ee5eadf88958d562d7c
+# We explicit tell short hash to not depend on git
+ARG SPCONV_COMMIT_SHORT=5961c22
+# We do version replacement to include build number and commit hash
+ARG SPCONV_VERSION=1.2.1
+# The torch version should be the minimum that supports the Cuda version AND
+# that provides forward compatibility to allow this package to be used by newer
+# versions.
+ARG TORCH_VERSION=1.8.0
+# OS version affects the tooling used (i.e.: gcc version).
+ARG UBUNTU_VERSION=18.04
+# This depends on the required version by the package cmake scripts.
+# The one provided by Ubuntu 18.04 (cmake 3.10) is not supported by spconv.
+ARG CMAKE_VERSION=3.15.0
+
+#
+# Build python via pyenv
+#
+FROM ubuntu:${UBUNTU_VERSION} as pyenv
+ARG PYTHON_VERSION
+
+ENV LANG=C.UTF-8 \
+	DEBIAN_FRONTEND=noninteractive \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONUNBUFFERED=1
+
+# This replaces the need to run pyenv init.
+ENV PYENV_ROOT=/pyenv \
+	PATH=/pyenv/shims:${PATH}
+
+# Build dependencies in this order
+RUN set -ex; apt-get update \
+	&& apt-get install --assume-yes --no-install-recommends \
+	build-essential \
+	ca-certificates \
+	curl \
+	git \
+	libbz2-dev \
+	libffi-dev \
+	libgdbm-dev \
+	liblzma-dev \
+	libncurses5-dev \
+	libnss3-dev \
+	libreadline-dev \
+	libsqlite3-dev \
+	libssl-dev \
+	zlib1g-dev \
+	&& rm -rf /var/lib/apt/lists/*
+
+RUN set -ex; git clone --branch v1.2.26 --depth 1 https://github.com/pyenv/pyenv.git /pyenv \
+	&& /pyenv/bin/pyenv install --verbose ${PYTHON_VERSION} \
+	&& /pyenv/bin/pyenv global ${PYTHON_VERSION} \
+	&& /pyenv/shims/pip install --upgrade pip pipenv setuptools wheel \
+	\
+	&& find /pyenv -depth \
+	\( \
+	\( -type d -a \( -name test -o -name tests -o -name idle_test \) \) \
+	-o \( -type f -a \( -name '*.pyc' -o -name '*.pyo' -o -name '*.a' \) \) \
+	\) -exec rm -rf '{}' + \
+	\
+	&& rm -fr /tmp/*
+
+
+#
+# Build cmake
+#
+FROM ubuntu:${UBUNTU_VERSION} as cmake
+ARG CMAKE_VERSION
+
+ENV LANG=C.UTF-8 \
+	DEBIAN_FRONTEND=noninteractive
+
+RUN set -ex; apt-get update \
+	&& apt-get install --assume-yes --no-install-recommends \
+	build-essential \
+	ca-certificates \
+	wget \
+	&& rm -rf /var/lib/apt/lists/*
+
+RUN set -ex; wget https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-Linux-x86_64.sh \
+	-O /tmp/cmake-install.sh \
+	&& chmod u+x /tmp/cmake-install.sh \
+	&& mkdir /usr/local/cmake \
+	&& /tmp/cmake-install.sh --skip-license --prefix=/usr/local/cmake \
+	&& rm /tmp/cmake-install.sh
+
+#
+# Base cuda image with -dev packages where we build dependencies (cuda devel +
+# python).
+#
+# We aim to build packages on this image.
+#
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn${CUDNN_MAJOR_VERSION}-devel-ubuntu${UBUNTU_VERSION} as base-devel
+# Need to re-declare the args to make them available in this context.
+ARG CUDA_MAJOR_VERSION
+ARG CUDA_MINOR_VERSION
+
+ENV LANG=C.UTF-8 \
+	DEBIAN_FRONTEND=noninteractive \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONUNBUFFERED=1
+
+# This replaces the need to run pyenv init.
+ENV PYENV_ROOT=/pyenv \
+	PATH=/pyenv/shims:${PATH}
+
+COPY --from=pyenv /pyenv /pyenv
+
+# Build dependencies in this order:
+# - build tooling
+# - cuda extras
+RUN set -ex; apt-get update \
+	&& apt-get install --assume-yes --no-install-recommends \
+	build-essential \
+	git \
+	wget \
+	&& apt-get install --assume-yes --no-install-recommends \
+	cuda-nvrtc-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
+	cuda-nvrtc-dev-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
+	&& rm -rf /var/lib/apt/lists/*
+
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+
+#
+# Runtime base image (cuda runtime + python)
+#
+# We aim to test packages on this image. This should contain same libraries as
+# the dev image without development headers.
+#
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn${CUDNN_MAJOR_VERSION}-runtime-ubuntu${UBUNTU_VERSION} as base-runtime
+# Need to re-declare the args to make them available in this context.
+ARG CUDA_MAJOR_VERSION
+ARG CUDA_MINOR_VERSION
+
+ENV LANG=C.UTF-8 \
+	DEBIAN_FRONTEND=noninteractive \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONUNBUFFERED=1
+
+# This replaces the need to run pyenv init.
+ENV PYENV_ROOT=/pyenv \
+	PATH=/pyenv/shims:${PATH}
+
+COPY --from=pyenv /pyenv /pyenv
+
+# Runtime system dependencies grouped in this order:
+# - cuda extras
+# - python
+RUN set -ex; apt-get update \
+	&& apt-get install --assume-yes --no-install-recommends \
+	cuda-nvrtc-${CUDA_MAJOR_VERSION}-${CUDA_MINOR_VERSION} \
+	&& apt-get install --assume-yes --no-install-recommends \
+	libbz2-1.0 \
+	libffi6 \
+	libgdbm5 \
+	liblzma5 \
+	libncurses5 \
+	libnss3 \
+	libreadline7 \
+	libsqlite3-0 \
+	libssl1.1 \
+	zlib1g \
+	&& rm -rf /var/lib/apt/lists/*
+
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+
+#
+# Build python virtual environment with the dependencies required to build
+# spconv.
+#
+FROM base-devel as venv
+ARG CUDA_MAJOR_VERSION
+ARG CUDA_MINOR_VERSION
+ARG TORCH_VERSION
+
+# - Creates virtualenv /venv 
+# - Updates pip/wheel packages
+# - Install python requirements
+# - Cleanup
+RUN set -ex; python -m venv /venv \
+	&& /venv/bin/python -m pip install --upgrade pip wheel \
+	&& /venv/bin/python -m pip install \
+	torch==${TORCH_VERSION}+cu${CUDA_MAJOR_VERSION}${CUDA_MINOR_VERSION} \
+	--find-links https://download.pytorch.org/whl/torch_stable.html \
+	--no-cache-dir \
+	--only-binary :all: \
+	&& find /venv -depth \
+	\( \
+	\( -type d -a \( -name tests -o -name idle_test \) \) \
+	-o \( -type f -a \( -name '*.pyc' -o -name '*.pyo' -o -name '*.a' \) \) \
+	\) -exec rm -rf '{}' +
+
+
+#
+# Build spconv
+#
+FROM base-devel as spconv-build
+ARG BUILD_NUMBER
+ARG CUDA_MAJOR_VERSION
+ARG CUDA_MINOR_VERSION
+ARG SPCONV_BRANCH
+ARG SPCONV_COMMIT
+ARG SPCONV_COMMIT_SHORT
+ARG SPCONV_VERSION
+
+ENV PATH=/venv/bin:/usr/local/cmake/bin:${PATH}
+
+COPY --from=cmake /usr/local/cmake /usr/local/cmake
+COPY --from=venv /venv /venv
+
+# - Build dependencies for spconv
+# - Dependencies for auditwheel (manylinux)
+RUN set -ex; apt-get update \
+	&& apt-get install --assume-yes --no-install-recommends \
+	libboost-all-dev \
+	&& apt-get install --assume-yes --no-install-recommends \
+	patchelf \
+	unzip \
+	&& rm -rf /var/lib/apt/lists/*
+
+# - Clone from our org (we want to keep control over the source)
+# - Checkout specific commit (must update submodules too)
+# - Change package name to include cuda suffix
+# - Change build version with build number and commit hash (see PEP440)
+# - Build wheel
+# - Cleanup
+RUN set -eux; git clone --branch ${SPCONV_BRANCH} --depth 1 --recursive \
+	https://github.com/promaton/spconv.git /tmp/spconv \
+	&& cd /tmp/spconv \
+	&& git checkout --recurse-submodules ${SPCONV_COMMIT} \
+	&& sed -i "s/name='spconv',/name='spconv-cu${CUDA_MAJOR_VERSION}${CUDA_MINOR_VERSION}',/" setup.py \
+	&& sed -i "s/version='${SPCONV_VERSION}',/version='${SPCONV_VERSION}.post${BUILD_NUMBER}+g${SPCONV_COMMIT_SHORT}',/" setup.py \
+	&& SPCONV_FORCE_BUILD_CUDA=1 python setup.py bdist_wheel --dist-dir /dist \
+	&& rm -fr /tmp/*
+
+RUN set -ex; pip install auditwheel \
+	&& auditwheel show /dist/spconv*.whl \
+	&& auditwheel repair --plat manylinux_2_24_x86_64 /dist/spconv*.whl
+
+#
+# Test spconv package
+#
+FROM base-runtime as spconv-test
+ARG BUILD_NUMBER
+ARG CUDA_MAJOR_VERSION
+ARG CUDA_MINOR_VERSION
+ARG SPCONV_COMMIT_SHORT
+ARG SPCONV_VERSION
+
+ENV PATH=/venv/bin:${PATH}
+
+COPY --from=venv /venv /venv
+COPY --from=spconv-build /dist/spconv*.whl /dist/
+
+RUN set eux; pip install \
+	spconv-cu${CUDA_MAJOR_VERSION}${CUDA_MINOR_VERSION}==${SPCONV_VERSION}.post${BUILD_NUMBER}+g${SPCONV_COMMIT_SHORT} \
+	--find-links /dist \
+	--no-cache-dir
